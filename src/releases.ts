@@ -13,6 +13,7 @@ import { LRUCache } from "lru-cache";
 
 import {
   getDeviceRolloutBucket,
+  objectKeyFromArtifactUrl,
   streamToString,
   toSemverRange,
   verifyHash,
@@ -20,6 +21,19 @@ import {
 import { z, ZodError } from "zod";
 
 const DEFAULT_SKU = "jetkvm-v2";
+type ReleaseType = "app" | "system";
+
+/**
+ * Recovery image filename per SKU. eMMC variants are flashed via DFU + the
+ * Rockchip upgrade tool (RKDevTool format), while SDMMC variants are written
+ * to a microSD with balenaEtcher (dd-format zip). Add a new SKU here when
+ * shipping a new hardware variant; unmapped SKUs are rejected so a typo
+ * doesn't silently fall back to the wrong artifact.
+ */
+const RECOVERY_ARTIFACT_BY_SKU: Record<string, string> = {
+  "jetkvm-v2": "update.img",
+  "jetkvm-v2-sdmmc": "update_sd.img.zip",
+};
 
 /** Query param schema builders for common patterns */
 const queryString = () =>
@@ -51,7 +65,7 @@ type LatestQuery = z.infer<typeof latestQuerySchema>;
 
 /**
  * Schema for the main Retrieve endpoint.
- * Requires deviceId and includes version constraints and forceUpdate flag.
+ * Requires deviceId and includes version constraints.
  */
 const retrieveQuerySchema = z.object({
   deviceId: z.string({ error: "Device ID is required" }).min(1, "Device ID is required"),
@@ -59,7 +73,6 @@ const retrieveQuerySchema = z.object({
   appVersion: queryString(),
   systemVersion: queryString(),
   sku: querySku(),
-  forceUpdate: queryBoolean(),
 });
 
 type RetrieveQuery = z.infer<typeof retrieveQuerySchema>;
@@ -87,6 +100,15 @@ export interface ReleaseMetadata {
   _maxSatisfying?: string;
 }
 
+interface DbRelease {
+  version: string;
+  rolloutPercentage: number;
+  artifacts: {
+    url: string;
+    hash: string;
+  }[];
+}
+
 const s3Client = new S3Client({
   endpoint: process.env.R2_ENDPOINT!,
   credentials: {
@@ -101,6 +123,13 @@ const releaseCache = new LRUCache<string, ReleaseMetadata>({
   ttl: 5 * 60 * 1000, // 5 minutes
 });
 
+const MISSING_SIG_URL = false;
+
+const sigUrlCache = new LRUCache<string, string | typeof MISSING_SIG_URL>({
+  max: 1000,
+  ttl: 5 * 60 * 1000, // 5 minutes
+});
+
 const redirectCache = new LRUCache<string, string>({
   max: 1000,
   ttl: 5 * 60 * 1000, // 5 minutes
@@ -110,6 +139,7 @@ const redirectCache = new LRUCache<string, string>({
 export function clearCaches() {
   releaseCache.clear();
   redirectCache.clear();
+  sigUrlCache.clear();
 }
 
 const bucketName = process.env.R2_BUCKET;
@@ -203,6 +233,67 @@ async function resolveArtifactPath(
   );
 }
 
+/**
+ * Resolves the signature URL for a given version if a .sig file exists in S3.
+ * Results are cached for 5 minutes.
+ */
+async function resolveSigUrl(
+  prefix: "app" | "system",
+  version: string,
+  sku: string,
+): Promise<string | undefined> {
+  const cacheKey = `${prefix}-${version}-${sku}`;
+  const cached = sigUrlCache.get(cacheKey);
+  if (cached !== undefined) return cached === MISSING_SIG_URL ? undefined : cached;
+
+  try {
+    const path = await resolveArtifactPath(prefix, version, sku);
+    const sigKey = `${path}.sig`;
+    if (await s3ObjectExists(sigKey)) {
+      const url = `${baseUrl}/${sigKey}`;
+      sigUrlCache.set(cacheKey, url);
+      return url;
+    }
+  } catch (error) {
+    if (error instanceof NotFoundError) {
+      // Version doesn't exist for this SKU — cache as absent
+      sigUrlCache.set(cacheKey, MISSING_SIG_URL);
+      return undefined;
+    }
+    // Don't cache transient errors (network, permissions, etc.)
+    throw error;
+  }
+
+  sigUrlCache.set(cacheKey, MISSING_SIG_URL);
+  return undefined;
+}
+
+/**
+ * Enriches a Release response with signature URLs by checking S3 for .sig files.
+ * Transient S3 errors are logged but don't block the response — sigUrl is optional.
+ */
+async function enrichWithSigUrls(release: Release, sku: string): Promise<void> {
+  const [appSigUrl, systemSigUrl] = await Promise.all([
+    release.appVersion
+      ? resolveSigUrl("app", release.appVersion, sku).catch(e => {
+          console.error(`Failed to resolve app sig URL for ${release.appVersion}:`, e);
+          return undefined;
+        })
+      : undefined,
+    release.systemVersion
+      ? resolveSigUrl("system", release.systemVersion, sku).catch(e => {
+          console.error(
+            `Failed to resolve system sig URL for ${release.systemVersion}:`,
+            e,
+          );
+          return undefined;
+        })
+      : undefined,
+  ]);
+  if (appSigUrl) release.appSigUrl = appSigUrl;
+  if (systemSigUrl) release.systemSigUrl = systemSigUrl;
+}
+
 async function getLatestVersion(
   prefix: "app" | "system",
   includePrerelease: boolean,
@@ -257,7 +348,7 @@ async function getLatestVersion(
   const hash = await streamToString(hashResponse.Body);
 
   // Cache the release metadata
-  const release = {
+  const release: ReleaseMetadata = {
     version: latestVersion,
     url,
     hash,
@@ -272,12 +363,14 @@ interface Release {
   appVersion: string;
   appUrl: string;
   appHash: string;
+  appSigUrl?: string;
   appCachedAt?: number;
   appMaxSatisfying?: string;
 
   systemVersion: string;
   systemUrl: string;
   systemHash: string;
+  systemSigUrl?: string;
   systemCachedAt?: number;
   systemMaxSatisfying?: string;
 }
@@ -308,6 +401,39 @@ function toRelease(
   return release as Release;
 }
 
+async function resolveSigUrlFromArtifactUrl(
+  artifactUrl: string,
+): Promise<string | undefined> {
+  const cacheKey = `artifact-url-${artifactUrl}`;
+  const cached = sigUrlCache.get(cacheKey);
+  if (cached !== undefined) return cached === MISSING_SIG_URL ? undefined : cached;
+
+  const sigUrl = `${artifactUrl}.sig`;
+  try {
+    const sigKey = `${objectKeyFromArtifactUrl(artifactUrl)}.sig`;
+    if (await s3ObjectExists(sigKey)) {
+      sigUrlCache.set(cacheKey, sigUrl);
+      return sigUrl;
+    }
+  } catch (error) {
+    console.error(`Failed to resolve sig URL for ${artifactUrl}:`, error);
+    return undefined;
+  }
+
+  sigUrlCache.set(cacheKey, MISSING_SIG_URL);
+  return undefined;
+}
+
+async function addStableSigUrls(release: Release): Promise<void> {
+  const [appSigUrl, systemSigUrl] = await Promise.all([
+    release.appUrl ? resolveSigUrlFromArtifactUrl(release.appUrl) : undefined,
+    release.systemUrl ? resolveSigUrlFromArtifactUrl(release.systemUrl) : undefined,
+  ]);
+
+  if (appSigUrl) release.appSigUrl = appSigUrl;
+  if (systemSigUrl) release.systemSigUrl = systemSigUrl;
+}
+
 async function getReleaseFromS3(
   includePrerelease: boolean,
   {
@@ -332,30 +458,115 @@ async function isDeviceEligibleForLatestRelease(
   return getDeviceRolloutBucket(deviceId) < rolloutPercentage;
 }
 
-async function getDefaultRelease(type: "app" | "system") {
+function compatibleArtifactSelect(sku: string) {
+  return {
+    where: { compatibleSkus: { has: sku } },
+    select: { url: true, hash: true },
+    orderBy: { id: "asc" as const },
+    take: 1,
+  };
+}
+
+function compatibleReleaseSelect(sku: string) {
+  return {
+    version: true,
+    rolloutPercentage: true,
+    artifacts: compatibleArtifactSelect(sku),
+  } as const;
+}
+
+function dbReleaseToMetadata(
+  release: DbRelease,
+  sku: string,
+  maxSatisfying?: string,
+): ReleaseMetadata {
+  const artifact = release.artifacts[0];
+  if (!artifact) {
+    throw new NotFoundError(
+      `Version ${release.version} predates SKU support and cannot serve SKU "${sku}"`,
+    );
+  }
+
+  return {
+    version: release.version,
+    url: artifact.url,
+    hash: artifact.hash,
+    _maxSatisfying: maxSatisfying,
+  };
+}
+
+async function getDefaultRelease(type: ReleaseType, sku: string): Promise<DbRelease> {
   const rolledOutReleases = await prisma.release.findMany({
-    where: { rolloutPercentage: 100, type },
-    select: { version: true, url: true, hash: true },
+    where: { type, rolloutPercentage: 100 },
+    select: compatibleReleaseSelect(sku),
   });
 
   if (rolledOutReleases.length === 0) {
-    throw new InternalServerError(`No default release found for type ${type}`);
+    throw new InternalServerError(
+      `No default release found for type ${type} and SKU "${sku}"`,
+    );
   }
 
-  // Get the latest default version from the rolled out releases
+  // Only consider releases that ship a binary for this SKU. Without this,
+  // the newest 100%-rolled-out release wins even if it has no compatible
+  // artifact, masking older releases that do.
+  const compatibleReleases = rolledOutReleases.filter(r => r.artifacts.length > 0);
+
+  if (compatibleReleases.length === 0) {
+    throw new NotFoundError(
+      `No default ${type} release available for SKU "${sku}"`,
+    );
+  }
+
   const latestVersion = semver.maxSatisfying(
-    rolledOutReleases.map(r => r.version),
+    compatibleReleases.map(r => r.version),
     "*",
   ) as string;
 
-  // Get the release with the latest default version
-  const latestDefaultRelease = rolledOutReleases.find(r => r.version === latestVersion);
+  const latestDefaultRelease = compatibleReleases.find(r => r.version === latestVersion);
 
   if (!latestDefaultRelease) {
-    throw new InternalServerError(`No default release found for type ${type}`);
+    throw new InternalServerError(
+      `No default release found for type ${type} and SKU "${sku}"`,
+    );
   }
 
   return latestDefaultRelease;
+}
+
+async function getLatestRelease(type: ReleaseType, sku: string): Promise<DbRelease> {
+  return getReleaseByRange(type, sku, "*");
+}
+
+async function getReleaseByRange(
+  type: ReleaseType,
+  sku: string,
+  range: string,
+): Promise<DbRelease> {
+  const releases = await prisma.release.findMany({
+    where: { type },
+    select: compatibleReleaseSelect(sku),
+  });
+
+  if (releases.length === 0) {
+    throw new NotFoundError(`No release found for type ${type} and SKU "${sku}"`);
+  }
+
+  const latestVersion = semver.maxSatisfying(
+    releases.map(r => r.version),
+    range,
+  ) as string;
+
+  if (!latestVersion) {
+    throw new NotFoundError(`No ${type} release found that satisfies ${range}`);
+  }
+
+  const latestRelease = releases.find(r => r.version === latestVersion);
+  if (!latestRelease) {
+    throw new NotFoundError(`No ${type} release found that satisfies ${range}`);
+  }
+
+  return latestRelease;
 }
 
 export async function Retrieve(req: Request, res: Response) {
@@ -365,90 +576,84 @@ export async function Retrieve(req: Request, res: Response) {
   const systemVersion = toSemverRange(query.systemVersion);
   const skipRollout = appVersion !== "*" || systemVersion !== "*";
 
-  // Get the latest release from S3
-  let remoteRelease: Release;
-  try {
-    remoteRelease = await getReleaseFromS3(query.prerelease, {
-      appVersion,
-      systemVersion,
-      sku: query.sku,
-    });
-  } catch (error) {
-    console.error(error);
-    if (error instanceof NotFoundError) {
-      throw error;
+  // Prereleases are not imported into the DB by the stable sync script.
+  if (query.prerelease) {
+    let remoteRelease: Release;
+    try {
+      remoteRelease = await getReleaseFromS3(query.prerelease, {
+        appVersion,
+        systemVersion,
+        sku: query.sku,
+      });
+    } catch (error) {
+      console.error(error);
+      if (error instanceof NotFoundError) {
+        throw error;
+      }
+      throw new InternalServerError(`Failed to get the latest release from S3: ${error}`);
     }
-    throw new InternalServerError(`Failed to get the latest release from S3: ${error}`);
-  }
 
-  // If the request is for prereleases, ignore the rollout percentage and just return the latest release
-  // This is useful for the OTA updater to get the latest prerelease version
-  // This also prevents us from storing the rollout percentage for prerelease versions
-
-  // If the version isn't a wildcard, we skip the rollout percentage check
-  if (query.prerelease || skipRollout) {
+    await enrichWithSigUrls(remoteRelease, query.sku);
     return res.json(remoteRelease);
   }
 
-  // Fetch or create the latest app release
-  const latestAppRelease = await prisma.release.upsert({
-    where: { version_type: { version: remoteRelease.appVersion, type: "app" } },
-    update: {},
-    create: {
-      version: remoteRelease.appVersion,
-      rolloutPercentage: 10,
-      url: remoteRelease.appUrl,
-      type: "app",
-      hash: remoteRelease.appHash,
-    },
-    select: { version: true, url: true, rolloutPercentage: true, hash: true },
-  });
-
-  // Fetch or create the latest system release
-  const latestSystemRelease = await prisma.release.upsert({
-    where: { version_type: { version: remoteRelease.systemVersion, type: "system" } },
-    update: {},
-    create: {
-      version: remoteRelease.systemVersion,
-      rolloutPercentage: 10,
-      url: remoteRelease.systemUrl,
-      type: "system",
-      hash: remoteRelease.systemHash,
-    },
-    select: { version: true, url: true, rolloutPercentage: true, hash: true },
-  });
-
-  /*
-    Return the latest release if forceUpdate is true, bypassing rollout rules.
-    This occurs when a user manually checks for updates in the app UI.
-    Background update checks follow the normal rollout percentage rules, to ensure controlled, gradual deployment of updates.
-  */
-  if (query.forceUpdate) {
-    return res.json(toRelease(latestAppRelease, latestSystemRelease));
+  // Version-constrained stable requests skip rollout but still read DB metadata.
+  if (skipRollout) {
+    const responseJson = toRelease(
+      dbReleaseToMetadata(
+        await getReleaseByRange("app", query.sku, appVersion),
+        query.sku,
+        appVersion,
+      ),
+      dbReleaseToMetadata(
+        await getReleaseByRange("system", query.sku, systemVersion),
+        query.sku,
+        systemVersion,
+      ),
+    );
+    await addStableSigUrls(responseJson);
+    return res.json(responseJson);
   }
 
-  const defaultAppRelease = await getDefaultRelease("app");
-  const defaultSystemRelease = await getDefaultRelease("system");
+  const [latestAppRelease, latestSystemRelease, defaultAppRelease, defaultSystemRelease] =
+    await Promise.all([
+      getLatestRelease("app", query.sku),
+      getLatestRelease("system", query.sku),
+      getDefaultRelease("app", query.sku),
+      getDefaultRelease("system", query.sku),
+    ]);
 
-  const responseJson = toRelease(defaultAppRelease, defaultSystemRelease);
+  // Background update checks follow rollout percentages so new releases roll
+  // out gradually. Devices outside the bucket fall back to the default (the
+  // newest 100%-rolled-out release). If the latest release lacks a compatible
+  // artifact for this SKU (e.g. a SKU-specific build hasn't shipped yet) we
+  // silently keep the default rather than 404 the whole request.
+  const responseJson = toRelease(
+    dbReleaseToMetadata(defaultAppRelease, query.sku),
+    dbReleaseToMetadata(defaultSystemRelease, query.sku),
+  );
 
   if (
-    await isDeviceEligibleForLatestRelease(
+    latestAppRelease.artifacts.length > 0 &&
+    (await isDeviceEligibleForLatestRelease(
       latestAppRelease.rolloutPercentage,
       query.deviceId,
-    )
+    ))
   ) {
-    setAppRelease(responseJson, latestAppRelease);
+    setAppRelease(responseJson, dbReleaseToMetadata(latestAppRelease, query.sku));
   }
 
   if (
-    await isDeviceEligibleForLatestRelease(
+    latestSystemRelease.artifacts.length > 0 &&
+    (await isDeviceEligibleForLatestRelease(
       latestSystemRelease.rolloutPercentage,
       query.deviceId,
-    )
+    ))
   ) {
-    setSystemRelease(responseJson, latestSystemRelease);
+    setSystemRelease(responseJson, dbReleaseToMetadata(latestSystemRelease, query.sku));
   }
+
+  await addStableSigUrls(responseJson);
 
   return res.json(responseJson);
 }
@@ -479,6 +684,11 @@ function releaseCacheKey(prefix: string, query: LatestQuery): string {
 export const RetrieveLatestSystemRecovery = cachedRedirect(
   query => releaseCacheKey("system-recovery", query),
   async query => {
+    const recoveryArtifact = RECOVERY_ARTIFACT_BY_SKU[query.sku];
+    if (!recoveryArtifact) {
+      throw new BadRequestError(`Unsupported SKU "${query.sku}"`);
+    }
+
     // Get the latest system recovery image from S3. It's stored in the system/ folder.
     const listCommand = new ListObjectsV2Command({
       Bucket: bucketName,
@@ -505,12 +715,13 @@ export const RetrieveLatestSystemRecovery = cachedRedirect(
       throw new NotFoundError("No valid system recovery versions found");
     }
 
-    // Resolve the artifact path with SKU support (using update.img for recovery)
+    // Resolve the artifact path with SKU support; the artifact filename
+    // depends on the SKU (eMMC = update.img, SDMMC = update_sd.img.zip).
     const artifactPath = await resolveArtifactPath(
       "system",
       latestVersion,
       query.sku,
-      "update.img",
+      recoveryArtifact,
     );
 
     const [firmwareFile, hashFile] = await Promise.all([
